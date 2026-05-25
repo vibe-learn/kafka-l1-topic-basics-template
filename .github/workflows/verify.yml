@@ -1,0 +1,87 @@
+name: Verify homework
+
+# Runs on every push. After tests complete (pass OR fail), POSTs the result
+# to the Vibe Learn platform's webhook endpoint. The platform server then
+# performs a GitHub API double-check to verify the workflow_run actually
+# ran with the conclusion we claim, before flipping homework state.
+#
+# Security note: this workflow does NOT use HMAC or secrets. The webhook
+# body is a HINT; the platform trusts the GitHub API verdict it queries
+# back, not the body. So leaking the webhook URL is fine.
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run tests
+        id: gotest
+        run: |
+          set -o pipefail
+          go test ./... -v 2>&1 | tee /tmp/test_output.log
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Determine status
+        id: status
+        if: always()
+        run: |
+          if [ "${{ steps.gotest.outcome }}" = "success" ]; then
+            echo "value=green" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=red" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Vibe Learn platform
+        if: always()
+        env:
+          # Set this to your Vibe Learn deployment's webhook URL.
+          # Example for local dev (using ngrok): https://abc123.ngrok.io/webhook/github
+          # Example for production: https://vibe-learn.example.com/webhook/github
+          VIBE_LEARN_WEBHOOK_URL: "REPLACE_WITH_YOUR_VIBE_LEARN_URL/webhook/github"
+        run: |
+          LOG_EXCERPT=$(tail -c 4096 /tmp/test_output.log | head -c 4096 | jq -Rs .)
+          PAYLOAD=$(jq -n \
+            --arg student_login "${{ github.repository_owner }}" \
+            --arg repo_full_name "${{ github.repository }}" \
+            --arg lesson_slug "l1_topic_basics" \
+            --arg sha "${{ github.sha }}" \
+            --arg status "${{ steps.status.outputs.value }}" \
+            --argjson log_excerpt "$LOG_EXCERPT" \
+            '{student_login: $student_login, repo_full_name: $repo_full_name, lesson_slug: $lesson_slug, sha: $sha, status: $status, log_excerpt: $log_excerpt}')
+
+          echo "Posting to Vibe Learn..."
+          echo "$PAYLOAD" | head -c 500
+
+          if [ "$VIBE_LEARN_WEBHOOK_URL" = "REPLACE_WITH_YOUR_VIBE_LEARN_URL/webhook/github" ]; then
+            echo ""
+            echo "WARNING: VIBE_LEARN_WEBHOOK_URL is not configured."
+            echo "Edit .github/workflows/verify.yml in the TEMPLATE repo to set the real URL."
+            exit 0
+          fi
+
+          curl -sS -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$VIBE_LEARN_WEBHOOK_URL" || true
+
+          echo ""
+          echo "Notification posted (or attempted)."
+
+      - name: Fail the workflow if tests failed
+        if: steps.status.outputs.value == 'red'
+        run: |
+          echo "Tests failed — see logs above. Vibe Learn has been notified."
+          exit 1
